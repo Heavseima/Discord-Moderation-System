@@ -6,28 +6,24 @@ import os
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import re
+from zoneinfo import ZoneInfo
 
 MODEL_ID = "Franklin001/sentimental"
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Load sentiment model
+# Load sentiment model from Hugging Face
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_ID)
 model.eval()
 
+
 # -------- TIME PARSER & FORMATTER --------
 def parse_time_input(time_str: str):
-    """
-    Accepts formats like:
-    5m, 5mn, 5 min, 5 minutes
-    2h, 2hr, 2 hours
-    1d, 2 days
-    Returns total minutes as integer.
-    """
+    """Accepts 5m, 5mn, 5 min, 2h, 1d etc., returns total minutes as int"""
     time_str = time_str.lower().strip()
 
-    # --- Minutes ---
+    # Minutes
     minute_patterns = [
         r"^(\d+)\s*m$", r"^(\d+)\s*mn$", r"^(\d+)\s*min$",
         r"^(\d+)\s*mins$", r"^(\d+)\s*minute$", r"^(\d+)\s*minutes$"
@@ -37,7 +33,7 @@ def parse_time_input(time_str: str):
         if match:
             return int(match.group(1))
 
-    # --- Hours ---
+    # Hours
     hour_patterns = [
         r"^(\d+)\s*h$", r"^(\d+)\s*hr$", r"^(\d+)\s*hrs$",
         r"^(\d+)\s*hour$", r"^(\d+)\s*hours$"
@@ -47,7 +43,7 @@ def parse_time_input(time_str: str):
         if match:
             return int(match.group(1)) * 60
 
-    # --- Days ---
+    # Days
     day_patterns = [
         r"^(\d+)\s*d$", r"^(\d+)\s*day$", r"^(\d+)\s*days$"
     ]
@@ -58,12 +54,9 @@ def parse_time_input(time_str: str):
 
     return None
 
+
 def format_time(minutes: int):
-    """
-    Converts total minutes to human-friendly format, e.g.:
-    8 -> 8 minutes
-    125 -> 2 hours 5 minutes
-    """
+    """Convert minutes → user-friendly format, e.g., 2 hours 5 minutes"""
     hours = minutes // 60
     mins = minutes % 60
     parts = []
@@ -81,22 +74,26 @@ def analyze_sentiment(text):
         outputs = model(**inputs)
         probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
         confidence, label = torch.max(probs, dim=1)
-
     label_map = {0: "Negative", 1: "Neutral", 2: "Positive"}
     return label_map[label.item()], confidence.item()
 
 
-# -------- COG --------
+def generate_thick_bar(percentage, length=10):
+    """Create a thick unicode bar using ▰ and ▱"""
+    filled_units = int(round(length * percentage / 100))
+    empty_units = length - filled_units
+    return "▰" * filled_units + "▱" * empty_units
+
+
+# -------- MAIN COG --------
 class Sentiment(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.local_tz = ZoneInfo("Asia/Phnom_Penh")
 
     @commands.command()
     async def analyze(self, ctx, *, time_input: str = "24h"):
-        """
-        Export messages from a custom time window.
-        Accepts inputs like 5m, 2h, 1d, etc.
-        """
+        """Analyze messages from a custom time window."""
         minutes = parse_time_input(time_input)
         if minutes is None:
             await ctx.send(
@@ -108,29 +105,30 @@ class Sentiment(commands.Cog):
             )
             return
 
-        # Minimum 5 minutes, maximum 7 days
-        MIN_MINUTES = 5
-        MAX_MINUTES = 7 * 24 * 60
-
-        if minutes < MIN_MINUTES:
-            await ctx.send("⚠️ Minimum time allowed is **5 minutes**.")
+        # Minimum/Maximum limits
+        if minutes < 5:
+            await ctx.send("⚠️ Minimum allowed is **5 minutes**.")
             return
-        if minutes > MAX_MINUTES:
-            await ctx.send("⚠️ Maximum time allowed is **7 days**.")
+        if minutes > 7 * 24 * 60:
+            await ctx.send("⚠️ Maximum allowed is **7 days**.")
             return
 
-        now = datetime.utcnow()
-        since_time = now - timedelta(minutes=minutes)
+        now_local = datetime.now(self.local_tz)
+        since_local = now_local - timedelta(minutes=minutes)
         friendly_time = format_time(minutes)
 
         await ctx.send(f"🕒 Fetching messages from the last **{friendly_time}**...")
 
         # Fetch messages
         messages = []
-        async for message in ctx.channel.history(limit=None, after=since_time):
+        async for message in ctx.channel.history(limit=None):
+            # Convert UTC -> Local
+            local_time = message.created_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(self.local_tz)
+            if local_time < since_local:
+                continue
             if message.author.bot or message.content.startswith("!"):
                 continue
-            messages.append([message.created_at.isoformat(), message.author.name, message.content])
+            messages.append([local_time.isoformat(), message.author.name, message.content])
 
         if not messages:
             await ctx.send("⚠️ No messages found in that time range.")
@@ -138,43 +136,51 @@ class Sentiment(commands.Cog):
 
         # Analyze messages
         results = []
-        for msg in messages:
-            content = msg[2].strip()
-            if not content:
-                continue
-            sentiment, confidence = analyze_sentiment(content)
-            results.append((msg[1], content, sentiment, confidence))
+        for time_str, author, text in messages:
+            sentiment, confidence = analyze_sentiment(text)
+            results.append((time_str, author, text, sentiment, confidence))
 
-        # Summary
+        # Summary stats
         total = len(results)
-        pos = sum(1 for _, _, s, _ in results if s == "Positive")
-        neu = sum(1 for _, _, s, _ in results if s == "Neutral")
-        neg = sum(1 for _, _, s, _ in results if s == "Negative")
+        pos = sum(1 for _, _, _, s, _ in results if s == "Positive")
+        neu = sum(1 for _, _, _, s, _ in results if s == "Neutral")
+        neg = sum(1 for _, _, _, s, _ in results if s == "Negative")
+        avg_conf = sum(c for _, _, _, _, c in results) / total * 100
+
         pos_pct = pos / total * 100
         neu_pct = neu / total * 100
         neg_pct = neg / total * 100
-        avg_conf = sum(c for _, _, _, c in results) / total * 100
 
-        embed = discord.Embed(
-            title=f"📊 Sentiment Summary (Last {friendly_time})",
-            color=0x5865F2
-        )
-        embed.add_field(name="🟢 Positive", value=f"{pos} ({pos_pct:.1f}%)")
-        embed.add_field(name="⚪ Neutral", value=f"{neu} ({neu_pct:.1f}%)")
-        embed.add_field(name="🔴 Negative", value=f"{neg} ({neg_pct:.1f}%)")
-        embed.add_field(name="📦 Total Messages", value=str(total), inline=False)
-        embed.add_field(name="🎯 Avg Confidence", value=f"{avg_conf:.2f}%", inline=False)
+        # Decide word
+        pos_word = "messages" if pos > 1 else "message"
+        neu_word = "messages" if neu > 1 else "message"
+        neg_word = "messages" if neg > 1 else "message"
 
-        await ctx.send(embed=embed)
+        # Fix width for alignment
+        max_count_len = max(len(str(pos)), len(str(neu)), len(str(neg)))
+        word_width = len("messages")  # the longest word
+        count_word_format = f"{{count:>{max_count_len}}} {{word:<{word_width}}}"
+
+        lines = [
+            f"📊 Sentiment Summary (Last {friendly_time})\n",
+            f"🟢 Positive  {count_word_format.format(count=pos, word=pos_word)}  │  {generate_thick_bar(pos_pct)}  {pos_pct:5.1f}%",
+            f"⚪ Neutral   {count_word_format.format(count=neu, word=neu_word)}  │  {generate_thick_bar(neu_pct)}  {neu_pct:5.1f}%",
+            f"🔴 Negative  {count_word_format.format(count=neg, word=neg_word)}  │  {generate_thick_bar(neg_pct)}  {neg_pct:5.1f}%",
+            f"\n📦 Total Messages : {total}",
+            f"🎯 Avg Confidence : {avg_conf:.2f}%",
+        ]
+
+
+        await ctx.send("```\n" + "\n".join(lines) + "\n```")
 
         # Save CSV
         csv_file = os.path.join(DATA_DIR, "analyzed_messages.csv")
         with open(csv_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["author", "message", "sentiment", "confidence"])
+            writer.writerow(["time", "author", "message", "sentiment", "confidence"])
             writer.writerows(results)
 
-        await ctx.send("✅ Sentiment analysis complete. File saved.")
+        await ctx.send("✅ Sentiment analysis complete.")
 
 
 async def setup(bot):
